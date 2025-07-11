@@ -1,103 +1,98 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import RedirectResponse
-from utils.logger import log  # async logging function
-import asyncio
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, HttpUrl
 from datetime import datetime, timedelta
-from pydantic import BaseModel, HttpUrl, validator
-import re
-import uuid
+import random, string, os
+from dotenv import load_dotenv
+
+from utils.logger import log
+
+load_dotenv()  # Load .env before anything else
 
 app = FastAPI()
 
-# In-memory store for shortened URLs
-url_store = {}
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# Model for request
-class ShortenRequest(BaseModel):
+urls_db, clicks_db = {}, {}
+
+def gen_code():
+    while True:
+        code = ''.join(random.choices(string.ascii_letters + string.digits, k=6))
+        if code not in urls_db:
+            return code
+
+class ShortenReq(BaseModel):
     url: HttpUrl
-    validity: int = 30  # default 30 minutes
+    validity: int = 30
     shortcode: str | None = None
 
-    @validator("validity")
-    def validity_must_be_positive(cls, v):
-        if v <= 0:
-            raise ValueError("Validity must be positive integer")
-        return v
+class ShortLinkRes(BaseModel):
+    shortLink: str
+    expiry: str
 
-    @validator("shortcode")
-    def shortcode_must_be_alphanumeric(cls, v):
-        if v and not re.fullmatch(r"[A-Za-z0-9]+", v):
-            raise ValueError("Shortcode must be alphanumeric")
-        return v
+@app.post("/shorturls", response_model=ShortLinkRes, status_code=201)
+async def create(data: ShortenReq):
+    await log("backend", "info", "route", f"Create request for {data.url}")
+    code = data.shortcode or gen_code()
 
+    if data.shortcode:
+        if not code.isalnum() or len(code) > 20:
+            await log("backend", "error", "handler", f"Invalid shortcode '{code}'")
+            raise HTTPException(400, "Custom shortcode invalid")
+        if code in urls_db:
+            await log("backend", "error", "handler", f"Duplicate shortcode '{code}'")
+            raise HTTPException(400, "Shortcode already exists")
 
-@app.post("/shorturls", status_code=201)
-async def create_short_url(req: ShortenRequest):
-    await log("backend", "info", "handler", f"Received request to shorten URL: {req.url}")
+    expiry = datetime.utcnow() + timedelta(minutes=data.validity)
+    urls_db[code] = {"url": str(data.url), "created": datetime.utcnow(), "expiry": expiry}
+    clicks_db[code] = []
+    await log("backend", "info", "route", f"Shortcode '{code}' created")
 
-    # Check shortcode uniqueness or generate new one
-    if req.shortcode:
-        if req.shortcode in url_store:
-            await log("backend", "error", "handler", f"Shortcode collision: {req.shortcode}")
-            raise HTTPException(status_code=400, detail="Shortcode already exists")
-        shortcode = req.shortcode
-    else:
-        # generate random shortcode (6 chars)
-        shortcode = uuid.uuid4().hex[:6]
-        while shortcode in url_store:
-            shortcode = uuid.uuid4().hex[:6]
+    return ShortLinkRes(shortLink=f"http://localhost:8000/{code}", expiry=expiry.isoformat())
 
-    expiry = datetime.utcnow() + timedelta(minutes=req.validity)
+@app.get("/shorturls/{code}")
+async def stats(code: str):
+    await log("backend", "info", "route", f"Stats request for {code}")
+    if code not in urls_db:
+        await log("backend", "warn", "handler", f"Stats not found {code}")
+        raise HTTPException(404, "Shortcode not found")
 
-    url_store[shortcode] = {
-        "url": str(req.url),
-        "created": datetime.utcnow(),
-        "expiry": expiry,
-        "clicks": [],
-    }
-
-    await log("backend", "info", "handler", f"Short URL created: {shortcode} -> {req.url}")
-
+    rec = urls_db[code]
     return {
-        "shortLink": f"http://localhost:8000/{shortcode}",
-        "expiry": expiry.isoformat() + "Z",
+      "original_url": rec["url"],
+      "created_at": rec["created"].isoformat(),
+      "expiry": rec["expiry"].isoformat(),
+      "total_clicks": len(clicks_db[code]),
+      "clicks": clicks_db[code]
     }
 
+@app.get("/{code}")
+async def redirect_endpoint(code: str, request: Request):
+    await log("backend", "info", "route", f"Redirect request for {code}")
+    if code not in urls_db:
+        await log("backend", "warn", "handler", f"Redirect not found {code}")
+        raise HTTPException(404, "Shortcode not found")
 
-@app.get("/{shortcode}")
-async def redirect_short_url(shortcode: str):
-    await log("backend", "info", "handler", f"Redirect request for shortcode: {shortcode}")
-    record = url_store.get(shortcode)
-    if not record:
-        await log("backend", "warn", "handler", f"Shortcode not found: {shortcode}")
-        raise HTTPException(status_code=404, detail="Shortcode not found")
+    rec = urls_db[code]
+    if datetime.utcnow() > rec["expiry"]:
+        await log("backend", "warn", "handler", f"Expired {code}")
+        raise HTTPException(410, "Short URL expired")
 
-    if datetime.utcnow() > record["expiry"]:
-        await log("backend", "warn", "handler", f"Shortcode expired: {shortcode}")
-        raise HTTPException(status_code=410, detail="Shortcode expired")
-
-    # Record click data (minimal example)
-    record["clicks"].append({
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "referrer": "N/A",  # Could capture from request headers if needed
-        "location": "N/A",
+    clicks_db[code].append({
+        "timestamp": datetime.utcnow().isoformat(),
+        "referrer": request.headers.get("referer"),
+        "geo": request.client.host
     })
+    await log("backend", "info", "route", f"Logged click for {code}")
+    return RedirectResponse(rec["url"])
 
-    return RedirectResponse(record["url"])
-
-
-@app.get("/shorturls/{shortcode}")
-async def get_short_url_stats(shortcode: str):
-    await log("backend", "info", "handler", f"Stats request for shortcode: {shortcode}")
-    record = url_store.get(shortcode)
-    if not record:
-        await log("backend", "warn", "handler", f"Shortcode not found for stats: {shortcode}")
-        raise HTTPException(status_code=404, detail="Shortcode not found")
-
-    return {
-        "url": record["url"],
-        "created": record["created"].isoformat() + "Z",
-        "expiry": record["expiry"].isoformat() + "Z",
-        "clicks_count": len(record["clicks"]),
-        "clicks": record["clicks"],
-    }
+@app.get("/test-log")
+async def test_log():
+    await log("backend", "info", "utils", "Manual test log from /test-log endpoint")
+    return {"status": "Log sent"}
